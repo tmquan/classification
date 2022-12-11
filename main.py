@@ -21,8 +21,8 @@ from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.utilities.seed import seed_everything
 
-from monai.losses.dice import DiceLoss
-from monai.networks.nets import EfficientNetBN
+from monai.losses.dice import DiceLoss, DiceFocalLoss
+from monai.networks.nets import EfficientNetBN, DenseNet121, DenseNet201
 
 from datamodule import DICOMDataModule
 
@@ -46,32 +46,52 @@ class DICOMLightningModule(LightningModule):
                 pretrained=True, 
                 adv_prop=True,
             ),
+            # DenseNet201(
+            #     spatial_dims=2, 
+            #     in_channels=1,
+            #     out_channels=1,
+            #     pretrained=True,
+            #     droutout=0.5
+            # ),
             nn.Sigmoid(),
         )
 
-        self.loss = DiceLoss()
+        # logits -> nn.BCEWithLogitsLoss
+        # logits -> sigmoid -> nn.BCELoss
+        # self.loss_func = torch.nn.BCEWithLogitsLoss()
+        # weight = torch.FloatTensor([1158/54706, 53548/54706]) 
+        weight = torch.FloatTensor([53548/54706]) 
+        self.loss_func = torch.nn.BCELoss(weight=weight)
+        # pos_weight = torch.FloatTensor([53548/1158]) 
+        # self.loss_func = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        # self.loss_func = DiceFocalLoss()
         self.save_hyperparameters()
 
     def forward(self, image):
-        return self.model(image)
+        return self.model(image*2-1)
 
     def _common_step(self, batch, batch_idx, optimizer_idx, stage: Optional[str] = 'evaluation'):
         image = batch["image"]
         label = batch["label"]
-        _device = image.device
-        isinverted = batch["isinverted"]
-        laterality = batch["laterality"]
+        # _device = image.device
+        # isinverted = batch["isinverted"]
+        # laterality = batch["laterality"]
+        # label = torch.nn.functional.one_hot(torch.as_tensor(label)).float()
 
-        # Invert the image if true
-        image[isinverted == 1.0] = 1.0 - image[isinverted == 1.0]
+        # # Invert the image if true
+        # # image[[(isinverted == 1.0)]] = 1.0 - image[[(isinverted == 1.0)]]
+        # for b in range(image.shape[0]):
+        #     if isinverted[[b]] == 0.0:
+        #         image[[b]] = 1.0 - image[[b]]
 
         preds = self.forward(image)
-        loss = self.loss(label, preds)
+        loss = self.loss_func(label.unsqueeze(dim=-1), preds)
+        self.log(f'{stage}_loss', loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
 
         if batch_idx == 0:
-            grid = torchvision.utils.make_grid(image, normalize=False, scale_each=False, nrow=8, padding=0)
+            grid = torchvision.utils.make_grid(image.transpose(2, 3), normalize=False, scale_each=False, nrow=4, padding=0)
             tensorboard = self.logger.experiment  # type: ignore
-            tensorboard.add_image(f'{stage}_samples', grid.clamp(0., 1.), self.current_epoch*self.batch_size + batch_idx)
+            tensorboard.add_image(f'{stage}_samples', grid, self.current_epoch*self.batch_size + batch_idx)
 
         info = {f'loss': loss}
         return info
@@ -100,7 +120,7 @@ class DICOMLightningModule(LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.RAdam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 200], gamma=0.1)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 20], gamma=0.1)
         return [optimizer], [scheduler]
 
 
@@ -110,9 +130,9 @@ if __name__ == "__main__":
     parser.add_argument("--notification_email", type=str, default="quantm88@gmail.com")
 
     # Model arguments
-    parser.add_argument("--batch_size", type=int, default=8, help="size of the batches")
+    parser.add_argument("--batch_size", type=int, default=16, help="size of the batches")
     parser.add_argument("--shape", type=int, default=512, help="spatial size of the tensor")
-    parser.add_argument("--epochs", type=int, default=301, help="number of epochs")
+    parser.add_argument("--epochs", type=int, default=31, help="number of epochs")
     parser.add_argument("--train_samples", type=int, default=1000, help="training samples")
     parser.add_argument("--val_samples", type=int, default=400, help="validation samples")
     parser.add_argument("--test_samples", type=int, default=400, help="test samples")
@@ -155,19 +175,23 @@ if __name__ == "__main__":
             checkpoint_callback,
         ],
         # accumulate_grad_batches=5,
-        # strategy="ddp_sharded", #"horovod", #"deepspeed", #"ddp_sharded",
-        strategy="fsdp",  # "fsdp", #"ddp_sharded", #"horovod", #"deepspeed", #"ddp_sharded",
-        precision=16,  # if hparams.use_amp else 32,
+        strategy="ddp_sharded", #"horovod", #"deepspeed", #"ddp_sharded",
+        # strategy="fsdp",  # "fsdp", #"ddp_sharded", #"horovod", #"deepspeed", #"ddp_sharded",
+        # precision=16,  # if hparams.use_amp else 32,
         # stochastic_weight_avg=True,
         # deterministic=False,
         # profiler="simple",
     )
     
-    # Create data module
+        # Create data module
     train_csvfile = os.path.join(hparams.datadir, "train.csv")
-    test_csvfile = None #os.path.join(hparams.datadir, "test.csv")
-    train_datadir = os.path.join(hparams.datadir, "train_images")
-    test_datadir = os.path.join(hparams.datadir, "test_images")
+    test_csvfile = os.path.join(hparams.datadir, "test.csv")
+    train_datadir = [
+        os.path.join(hparams.datadir, "train_images")
+    ]
+    test_datadir = [
+        os.path.join(hparams.datadir, "test_images")
+    ]
 
     datamodule = DICOMDataModule(
         train_datadir=train_datadir,
@@ -179,7 +203,6 @@ if __name__ == "__main__":
         batch_size=hparams.batch_size,
         shape=hparams.shape,
     )
-    datamodule.setup(seed=42)
 
     ####### Test camera mu and bandwidth ########
     # test_random_uniform_cameras(hparams, datamodule)

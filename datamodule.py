@@ -1,6 +1,7 @@
 import os
 import glob
 import pydicom
+import numpy as np
 import pandas as pd
 from typing import Callable, Optional, Sequence
 
@@ -21,9 +22,11 @@ from monai.transforms import (
     DivisiblePadd,
     RandFlipd,
     RandZoomd,
-    RandScaleCropd,
+    SqueezeDimd,
+    RandScaleCropd, 
+    RandRotated, 
     CropForegroundd,
-    Resized, Rotate90d, HistogramNormalized,
+    Resized, Rotate90d, 
     ScaleIntensityd,
     ScaleIntensityRanged,
     ToTensord,
@@ -59,7 +62,7 @@ class DICOMDataset(Dataset, Randomizable):
         self.files = glob_files(folders=self.datadir, extension='**/*.dcm')
 
         # Read the dataframe
-        self.df = pd.read_csv(self.csvfile)
+        self.df = pd.read_csv(self.csvfile).fillna(0)
         print("Data file: ", self.csvfile, len(self.df))
 
     def __len__(self) -> int:
@@ -73,33 +76,40 @@ class DICOMDataset(Dataset, Randomizable):
         patient_id, image_id = os.path.splitext(filepath)[0].split("/")[-2:]
         
         if self.df is not None:
-            label = self.df.loc[(self.df['patient_id'] == patient_id) & (self.df['image_id'] == image_id)]
-        else:
-            label = None
-
+            label = self.df.loc[(self.df['patient_id'] == int(patient_id)) & (self.df['image_id'] == int(image_id)), 'cancer'].values[0]
         data["image"] = filepath
-        data["patient_id"] = patient_id
-        data["image_id"] = image_id
-        data["label"] = label 
-
+        data["label"] = 0.9999 if label==1 else 0.0001
+        # data["label"] = 1. if label==1 else 0.
+        data["patient_id"] = patient_id if patient_id is not None else None
+        data["image_id"] = image_id if image_id is not None else None
+        
         # Attach other attributes
         # Extracting data from the mri file
         _dcm = pydicom.read_file(filepath)
 
         # depending on this value, X-ray may look inverted - fix that:
-        data["isinverted"] = 1.0 if _dcm.PhotometricInterpretation == "MONOCHROME1" else 0.0
-
+        # data["isinverted"] = 1.0 if _dcm.PhotometricInterpretation == "MONOCHROME1" else 0.0
+        if _dcm.PhotometricInterpretation is not None and _dcm.PhotometricInterpretation == "MONOCHROME1":
+            data["isinverted"] = 1.0
+        else: 
+            data["isinverted"] = 0.0
         # Extract the laterality
         # R right
         # L left
         # B both (e.g., cleavage)
         data["laterality"] = _dcm.ImageLaterality 
-
+        # print(data)
         # Apply other transforms for image augmentations
         if self.transform is not None:
             data = apply_transform(self.transform, data)
+
         return data
 
+class PhotometricInterpretationMONOCHROME1:
+    def __call__(self, data):
+        if data["isinverted"] == 0:
+            data["image"] = 1 - data["image"]
+        return data
 
 class DICOMDataModule(LightningDataModule):
     def __init__(self,
@@ -127,28 +137,40 @@ class DICOMDataModule(LightningDataModule):
 
         # self.setup()
         
-    def setup(self, seed: int = 2222, stage: Optional[str] = None):
+    def setup(self, seed: int = 42, stage: Optional[str] = None):
         # make assignments here (val/train/test split)
         # called on every process in DDP
         set_determinism(seed=seed)
 
     def train_dataloader(self):
         self.train_transforms = Compose([
-            LoadImaged(keys=["image"]),
-            EnsureChannelFirstd(keys=["image"],),
-            Spacingd(keys=["image"], pixdim=(1.0, 1.0), mode=["bilinear"], align_corners=True),
+            LoadImaged(
+                keys=["image"], 
+                reader="pydicomreader",
+                ensure_channel_first=True, 
+                # image_only=True, 
+                # overwriting=True, 
+                # meta_keys=["PhotometricInterpretation"], 
+                # allow_missing_keys=True, 
+                # simple_keys=True
+            ),
+            # EnsureChannelFirstd(keys=["image"],),
+            # Spacingd(keys=["image"], pixdim=(1.0, 1.0), mode=["bilinear"], align_corners=True),
+            # SqueezeDimd(keys=["image"], dim=3),
             ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0,),
-            CropForegroundd(keys=["image"], source_key="image2d", select_fn=(lambda x: x > 0), margin=0),
-            HistogramNormalized(keys=["image"], min=0.0, max=1.0,),  # type: ignore
-            RandZoomd(keys=["image"], prob=1.0, min_zoom=0.8, max_zoom=1.1, padding_mode='constant', mode=["trilinear"], align_corners=True),
-            Resized(keys=["image"], spatial_size=self.shape, size_mode="longest", mode=["trilinear"], align_corners=True),
-            RandFlipd(keys=["image"], prob=0.5, spatial_axis=2),
+            PhotometricInterpretationMONOCHROME1(), 
+            CropForegroundd(keys=["image"], source_key="image", select_fn=(lambda x: x > 0), margin=0),
+            # HistogramNormalized(keys=["image"], min=0.0, max=1.0,),  # type: ignore
+            # RandRotated(keys=["image"], prob=1.0, range_x=0.3),
+            # RandZoomd(keys=["image"], prob=1.0, min_zoom=0.8, max_zoom=1.1, padding_mode='constant', mode=["bilinear"], align_corners=True),
+            Resized(keys=["image"], spatial_size=self.shape, size_mode="longest", mode=["bilinear"], align_corners=True),
+            # RandFlipd(keys=["image"], prob=0.5, spatial_axis=1),
             DivisiblePadd(keys=["image"], k=self.shape, mode="constant", constant_values=0),
             ToTensord(keys=["image", "label", "isinverted", "laterality"],),
         ])
 
         self.train_datasets = DICOMDataset(
-            keys=["image", "label", "isinverted", "laterality"],
+            keys=["image", "label"], #, "isinverted", "laterality"],
             datadir=self.train_datadir,
             csvfile=self.train_csvfile,
             transform=self.train_transforms,  
@@ -166,20 +188,31 @@ class DICOMDataModule(LightningDataModule):
 
     def val_dataloader(self):
         self.val_transforms = Compose([
-            LoadImaged(keys=["image"]),
-            EnsureChannelFirstd(keys=["image"],),
-            Spacingd(keys=["image"], pixdim=(1.0, 1.0), mode=["bilinear"], align_corners=True),
+            LoadImaged(
+                keys=["image"], 
+                reader="pydicomreader",
+                ensure_channel_first=True, 
+                # image_only=True, 
+                # overwriting=True, 
+                # meta_keys=["PhotometricInterpretation"], 
+                # allow_missing_keys=True, 
+                # simple_keys=True
+            ),
+            # EnsureChannelFirstd(keys=["image"],),
+            # Spacingd(keys=["image"], pixdim=(1.0, 1.0), mode=["bilinear"], align_corners=True),
+            # SqueezeDimd(keys=["image"], dim=3),
             ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0,),
-            CropForegroundd(keys=["image"], source_key="image2d", select_fn=(lambda x: x > 0), margin=0),
-            HistogramNormalized(keys=["image"], min=0.0, max=1.0,),  # type: ignore
-            RandZoomd(keys=["image"], prob=1.0, min_zoom=0.8, max_zoom=1.1, padding_mode='constant', mode=["trilinear"], align_corners=True),
-            Resized(keys=["image"], spatial_size=self.shape, size_mode="longest", mode=["trilinear"], align_corners=True),
+            PhotometricInterpretationMONOCHROME1(), 
+            CropForegroundd(keys=["image"], source_key="image", select_fn=(lambda x: x > 0), margin=0),
+            # HistogramNormalized(keys=["image"], min=0.0, max=1.0,),  # type: ignore
+            # RandZoomd(keys=["image"], prob=1.0, min_zoom=0.8, max_zoom=1.1, padding_mode='edge', mode=["bilinear"], align_corners=True),
+            Resized(keys=["image"], spatial_size=self.shape, size_mode="longest", mode=["bilinear"], align_corners=True),
             DivisiblePadd(keys=["image"], k=self.shape, mode="constant", constant_values=0),
             ToTensord(keys=["image", "label", "isinverted", "laterality"],),
         ])
 
         self.val_datasets = DICOMDataset(
-            keys=["image", "label", "isinverted", "laterality"],
+            keys=["image", "label"], #, "isinverted", "laterality"],
             datadir=self.val_datadir,
             csvfile=self.val_csvfile,
             transform=self.val_transforms,
@@ -198,18 +231,22 @@ class DICOMDataModule(LightningDataModule):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--seed", type=int, default=2222)
-    parser.add_argument("--shape", type=int, default=256,help="isotropic shape")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--shape", type=int, default=512, help="isotropic shape")
     parser.add_argument("--datadir", type=str, default='data', help="data directory")
-    parser.add_argument("--batch_size", type=int, default=4, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
 
     hparams = parser.parse_args()
     
     # Create data module
     train_csvfile = os.path.join(hparams.datadir, "train.csv")
     test_csvfile = os.path.join(hparams.datadir, "test.csv")
-    train_datadir = os.path.join(hparams.datadir, "train_images")
-    test_datadir = os.path.join(hparams.datadir, "test_images")
+    train_datadir = [
+        os.path.join(hparams.datadir, "train_images")
+    ]
+    test_datadir = [
+        os.path.join(hparams.datadir, "test_images")
+    ]
 
     datamodule = DICOMDataModule(
         train_datadir=train_datadir,
