@@ -104,7 +104,7 @@ class DICOMLightningModule(LightningModule):
         # print(image.shape)
         # print(sampled_image.shape)
         # print(sampled_label.shape)
-        if batch_idx == 0:
+        if batch_idx % 10 == 0:
             grid = torchvision.utils.make_grid(
                 torch.cat([image.transpose(2, 3), 
                            sampled_image.transpose(2, 3), 
@@ -112,7 +112,7 @@ class DICOMLightningModule(LightningModule):
                 normalize=False, scale_each=False, nrow=8, padding=0
             )
             tensorboard = self.logger.experiment  # type: ignore
-            tensorboard.add_image(f'{stage}_samples', grid, self.current_epoch*self.batch_size + batch_idx)
+            tensorboard.add_image(f'{stage}_samples', grid, self.global_step // 10)
 
         info = {f'loss': loss}
         return info
