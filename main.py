@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch
 import resource
 import os
+import copy
+from fastprogress import progress_bar, master_bar
 import warnings
 warnings.filterwarnings("ignore")
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -25,6 +27,7 @@ from monai.losses.dice import DiceLoss, DiceFocalLoss
 from monai.networks.nets import EfficientNetBN, DenseNet121, DenseNet201
 
 from datamodule import DICOMDataModule
+from cdiff import *
 
 class DICOMLightningModule(LightningModule):
     def __init__(self, hparams, **kwargs):
@@ -32,12 +35,26 @@ class DICOMLightningModule(LightningModule):
         self.logsdir = hparams.logsdir
         self.lr = hparams.lr
         self.shape = hparams.shape
-        self.filter = hparams.filter
-
+        self.loss_func = nn.L1Loss()
         self.weight_decay = hparams.weight_decay
         self.batch_size = hparams.batch_size
-        self.devices = hparams.devices
-        self.model = nn.Sequential(
+
+        self.num_classes = 2
+        self.timesteps = hparams.timesteps
+        model = Unet(
+            dim = 64,
+            dim_mults = (1, 2, 4, 8),
+            num_classes = self.num_classes,
+            cond_drop_prob = 0.5, 
+            channels = 1,
+        )
+        self.diffusion = GaussianDiffusion(
+            model,
+            image_size = self.shape,
+            timesteps = self.timesteps
+        )
+
+        self.classifier = nn.Sequential(
             EfficientNetBN(
                 "efficientnet-b8", 
                 spatial_dims=2, 
@@ -46,50 +63,54 @@ class DICOMLightningModule(LightningModule):
                 pretrained=True, 
                 adv_prop=True,
             ),
-            # DenseNet201(
-            #     spatial_dims=2, 
-            #     in_channels=1,
-            #     out_channels=1,
-            #     pretrained=True,
-            #     droutout=0.5
-            # ),
             nn.Sigmoid(),
         )
-
-        # logits -> nn.BCEWithLogitsLoss
-        # logits -> sigmoid -> nn.BCELoss
-        # self.loss_func = torch.nn.BCEWithLogitsLoss()
-        # weight = torch.FloatTensor([1158/54706, 53548/54706]) 
-        weight = torch.FloatTensor([53548/54706]) 
-        self.loss_func = torch.nn.BCELoss(weight=weight)
-        # pos_weight = torch.FloatTensor([53548/1158]) 
-        # self.loss_func = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        # self.loss_func = DiceFocalLoss()
+        # self.loss_func = nn.BCELoss()
+        self.loss_func = DiceFocalLoss()
         self.save_hyperparameters()
 
     def forward(self, image):
-        return self.model(image*2-1)
+        pass
 
     def _common_step(self, batch, batch_idx, optimizer_idx, stage: Optional[str] = 'evaluation'):
         image = batch["image"]
         label = batch["label"]
-        # _device = image.device
-        # isinverted = batch["isinverted"]
-        # laterality = batch["laterality"]
-        # label = torch.nn.functional.one_hot(torch.as_tensor(label)).float()
+        _device = image.device
+        isinverted = batch["isinverted"]
+        laterality = batch["laterality"]
+        
+        # if label.ndim == 1 and self.num_classes == 2:
+        #     label = torch.cat([label.unsqueeze(-1), 1-label.unsqueeze(-1)], dim=1)
 
-        # # Invert the image if true
-        # # image[[(isinverted == 1.0)]] = 1.0 - image[[(isinverted == 1.0)]]
-        # for b in range(image.shape[0]):
-        #     if isinverted[[b]] == 0.0:
-        #         image[[b]] = 1.0 - image[[b]]
+        if stage == 'train':
+            gen_loss = self.diffusion(image, classes = label)
+            self.log(f'{stage}_gen_loss', gen_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
+        
+        with torch.no_grad():
+            sampled_image = self.diffusion.sample(
+                classes = label,
+                cond_scale = 3.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
+            )
+            sampled_label = label.view(image.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape)
+        
+        image_cat = torch.cat([image, sampled_image], dim=0)
+        label_cat = torch.cat([label, label], dim=0)
+        # label_cat = torch.where(label_cat < 0.5, label_cat + 0.0001, label_cat - 0.0001)
+        estim_cat = self.classifier(image_cat * 2.0 - 1.0)
+        cls_loss = self.loss_func(estim_cat, label_cat.unsqueeze(-1).float())
 
-        preds = self.forward(image)
-        loss = self.loss_func(label.unsqueeze(dim=-1), preds)
-        self.log(f'{stage}_loss', loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
-
+        self.log(f'{stage}_cls_loss', cls_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
+        loss = gen_loss + cls_loss if stage == 'train' else cls_loss
+        # print(image.shape)
+        # print(sampled_image.shape)
+        # print(sampled_label.shape)
         if batch_idx == 0:
-            grid = torchvision.utils.make_grid(image.transpose(2, 3), normalize=False, scale_each=False, nrow=4, padding=0)
+            grid = torchvision.utils.make_grid(
+                torch.cat([image.transpose(2, 3), 
+                           sampled_image.transpose(2, 3), 
+                           sampled_label.transpose(2, 3)], dim=-2), 
+                normalize=False, scale_each=False, nrow=8, padding=0
+            )
             tensorboard = self.logger.experiment  # type: ignore
             tensorboard.add_image(f'{stage}_samples', grid, self.current_epoch*self.batch_size + batch_idx)
 
@@ -136,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_samples", type=int, default=1000, help="training samples")
     parser.add_argument("--val_samples", type=int, default=400, help="validation samples")
     parser.add_argument("--test_samples", type=int, default=400, help="test samples")
+    parser.add_argument("--timesteps", type=int, default=100, help="timesteps")
 
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--lr", type=float, default=1e-4, help="adam: learning rate")
@@ -158,7 +180,7 @@ if __name__ == "__main__":
         filename='{epoch:02d}-{validation_loss_epoch:.2f}',
         save_top_k=-1,
         save_last=True,
-        every_n_epochs=5,
+        every_n_epochs=1,
     )
     lr_callback = LearningRateMonitor(logging_interval='step')
 
@@ -186,12 +208,8 @@ if __name__ == "__main__":
         # Create data module
     train_csvfile = os.path.join(hparams.datadir, "train.csv")
     test_csvfile = os.path.join(hparams.datadir, "test.csv")
-    train_datadir = [
-        os.path.join(hparams.datadir, "train_images")
-    ]
-    test_datadir = [
-        os.path.join(hparams.datadir, "test_images")
-    ]
+    train_datadir = os.path.join(hparams.datadir, "train_images")
+    test_datadir = os.path.join(hparams.datadir, "test_images")
 
     datamodule = DICOMDataModule(
         train_datadir=train_datadir,

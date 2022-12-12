@@ -3,7 +3,7 @@ import glob
 import pydicom
 import numpy as np
 import pandas as pd
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional, Sequence, List
 
 from argparse import ArgumentParser
 from monai.data import Dataset, DataLoader, list_data_collate
@@ -42,7 +42,8 @@ class DICOMDataset(Dataset, Randomizable):
         csvfile: str = None,   # type: ignore
         transform: Optional[Callable] = None,
         length: Optional[Callable] = None,
-        batch_size: int = 32,
+        batch_size: int = 32, 
+        upsample: bool = True,
     ) -> None: 
         self.keys = keys,
         self.datadir = datadir
@@ -50,20 +51,44 @@ class DICOMDataset(Dataset, Randomizable):
         self.length = length
         self.batch_size = batch_size
         self.transform = transform
-
+        self.upsample = upsample
         def glob_files(folders: str = None, extension: str = '*.nii.gz'):  # type: ignore
             assert folders is not None
-            paths = [glob.glob(os.path.join(folder, extension), recursive=True) for folder in folders]
+            # paths = [glob.glob(os.path.join(folder, extension), recursive=True) for folder in folders]
+            paths = glob.glob(os.path.join(folders, extension), recursive=True) 
             files = sorted([item for sublist in paths for item in sublist])
-            print(len(files))
-            print(files[:1])
             return files
 
-        self.files = glob_files(folders=self.datadir, extension='**/*.dcm')
+        if self.csvfile is not None:
+            # Read the dataframe
+            print("Data file: ", self.csvfile)
+            self.df = pd.read_csv(self.csvfile).fillna(0) # Fill not a number
+            print("Before upsampling: ")
+            print(self.df.describe())
+            if self.upsample:
+                ### Separate the majority and minority classes
+                df_minority = self.df[self.df['cancer']==1]
+                df_majority = self.df[self.df['cancer']==0]
+                ### Now, downsamples majority labels equal to the number of samples in the minority class
 
-        # Read the dataframe
-        self.df = pd.read_csv(self.csvfile).fillna(0)
-        print("Data file: ", self.csvfile, len(self.df))
+                df_minority_up = df_minority.sample(len(df_majority), random_state=0, replace=True)
+                ### concat the majority and minority dataframes
+                self.df = pd.concat([df_majority, df_minority_up])
+                ## Shuffle the dataset to prevent the model from getting biased by similar samples
+                self.df = self.df.sample(frac=1, random_state=0)
+                print("After upsampling: ")
+                print(self.df.describe())
+
+            self.files = [os.path.join(self.datadir, 
+                                       self.df.iloc[id].at["patient_id"].astype(str), 
+                                       self.df.iloc[id].at["image_id"].astype(str)+".dcm") \
+                                    for id in range(len(self.df)) ]
+            print(len(self.files))
+            print(self.files[:1])
+        else:
+            self.files = glob_files(folders=self.datadir, extension='**/*.dcm')  
+            print(len(self.files))
+            print(self.files[:1])
 
     def __len__(self) -> int:
         return min(self.length, len(self.files)) if self.length is not None else len(self.files)  # type: ignore
@@ -78,7 +103,7 @@ class DICOMDataset(Dataset, Randomizable):
         if self.df is not None:
             label = self.df.loc[(self.df['patient_id'] == int(patient_id)) & (self.df['image_id'] == int(image_id)), 'cancer'].values[0]
         data["image"] = filepath
-        data["label"] = 0.9999 if label==1 else 0.0001
+        data["label"] = 1 if label==1 else 0
         # data["label"] = 1. if label==1 else 0.
         data["patient_id"] = patient_id if patient_id is not None else None
         data["image_id"] = image_id if image_id is not None else None
@@ -90,14 +115,19 @@ class DICOMDataset(Dataset, Randomizable):
         # depending on this value, X-ray may look inverted - fix that:
         # data["isinverted"] = 1.0 if _dcm.PhotometricInterpretation == "MONOCHROME1" else 0.0
         if _dcm.PhotometricInterpretation is not None and _dcm.PhotometricInterpretation == "MONOCHROME1":
-            data["isinverted"] = 1.0
+            data["isinverted"] = 1
         else: 
-            data["isinverted"] = 0.0
+            data["isinverted"] = 0
         # Extract the laterality
-        # R right
         # L left
+        # R right
         # B both (e.g., cleavage)
-        data["laterality"] = _dcm.ImageLaterality 
+        if _dcm.ImageLaterality == "L":
+            data["laterality"] = 0
+        elif _dcm.ImageLaterality == "R":
+            data["laterality"] = 1
+        # elif _dcm.ImageLaterality == "B":
+        #     data["laterality"] = 2
         # print(data)
         # Apply other transforms for image augmentations
         if self.transform is not None:
@@ -110,6 +140,7 @@ class PhotometricInterpretationMONOCHROME1:
         if data["isinverted"] == 0:
             data["image"] = 1 - data["image"]
         return data
+
 
 class DICOMDataModule(LightningDataModule):
     def __init__(self,
@@ -159,13 +190,13 @@ class DICOMDataModule(LightningDataModule):
             # SqueezeDimd(keys=["image"], dim=3),
             ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0,),
             PhotometricInterpretationMONOCHROME1(), 
-            CropForegroundd(keys=["image"], source_key="image", select_fn=(lambda x: x > 0), margin=0),
+            CropForegroundd(keys=["image"], source_key="image", select_fn=(lambda x: x < 1), margin=0),
             # HistogramNormalized(keys=["image"], min=0.0, max=1.0,),  # type: ignore
             # RandRotated(keys=["image"], prob=1.0, range_x=0.3),
-            # RandZoomd(keys=["image"], prob=1.0, min_zoom=0.8, max_zoom=1.1, padding_mode='constant', mode=["bilinear"], align_corners=True),
+            # RandZoomd(keys=["image"], prob=1.0, min_zoom=1.0, max_zoom=1.2, padding_mode='constant', constant_values=1, mode=["bilinear"], align_corners=True),
             Resized(keys=["image"], spatial_size=self.shape, size_mode="longest", mode=["bilinear"], align_corners=True),
-            # RandFlipd(keys=["image"], prob=0.5, spatial_axis=1),
-            DivisiblePadd(keys=["image"], k=self.shape, mode="constant", constant_values=0),
+            RandFlipd(keys=["image"], prob=0.5, spatial_axis=0),
+            DivisiblePadd(keys=["image"], k=self.shape, mode="constant", constant_values=1),
             ToTensord(keys=["image", "label", "isinverted", "laterality"],),
         ])
 
@@ -175,6 +206,7 @@ class DICOMDataModule(LightningDataModule):
             csvfile=self.train_csvfile,
             transform=self.train_transforms,  
             batch_size=self.batch_size,  
+            length=100000,
         )
 
         self.train_loader = DataLoader(
@@ -203,11 +235,11 @@ class DICOMDataModule(LightningDataModule):
             # SqueezeDimd(keys=["image"], dim=3),
             ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0,),
             PhotometricInterpretationMONOCHROME1(), 
-            CropForegroundd(keys=["image"], source_key="image", select_fn=(lambda x: x > 0), margin=0),
+            CropForegroundd(keys=["image"], source_key="image", select_fn=(lambda x: x < 1), margin=0),
             # HistogramNormalized(keys=["image"], min=0.0, max=1.0,),  # type: ignore
             # RandZoomd(keys=["image"], prob=1.0, min_zoom=0.8, max_zoom=1.1, padding_mode='edge', mode=["bilinear"], align_corners=True),
             Resized(keys=["image"], spatial_size=self.shape, size_mode="longest", mode=["bilinear"], align_corners=True),
-            DivisiblePadd(keys=["image"], k=self.shape, mode="constant", constant_values=0),
+            DivisiblePadd(keys=["image"], k=self.shape, mode="constant", constant_values=1),
             ToTensord(keys=["image", "label", "isinverted", "laterality"],),
         ])
 
@@ -217,6 +249,7 @@ class DICOMDataModule(LightningDataModule):
             csvfile=self.val_csvfile,
             transform=self.val_transforms,
             batch_size=self.batch_size,
+            length=100000,
         )
 
         self.val_loader = DataLoader(
@@ -241,12 +274,8 @@ if __name__ == "__main__":
     # Create data module
     train_csvfile = os.path.join(hparams.datadir, "train.csv")
     test_csvfile = os.path.join(hparams.datadir, "test.csv")
-    train_datadir = [
-        os.path.join(hparams.datadir, "train_images")
-    ]
-    test_datadir = [
-        os.path.join(hparams.datadir, "test_images")
-    ]
+    train_datadir = os.path.join(hparams.datadir, "train_images")
+    test_datadir = os.path.join(hparams.datadir, "test_images")
 
     datamodule = DICOMDataModule(
         train_datadir=train_datadir,
