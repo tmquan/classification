@@ -74,8 +74,8 @@ class DICOMDataset(Dataset, Randomizable):
                 df_minority = self.df[self.df['cancer']==1]
                 df_majority = self.df[self.df['cancer']==0]
                 ### Now, downsamples majority labels equal to the number of samples in the minority class
-
-                df_minority_up = df_minority.sample(len(df_majority), random_state=0, replace=True)
+                ### Sum both to 100_000
+                df_minority_up = df_minority.sample( (100_000-len(df_majority)), random_state=0, replace=True)
                 ### concat the majority and minority dataframes
                 self.df = pd.concat([df_majority, df_minority_up])
                 ## Shuffle the dataset to prevent the model from getting biased by similar samples
