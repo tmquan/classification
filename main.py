@@ -80,12 +80,9 @@ class DICOMLightningModule(LightningModule):
         # isinverted = batch["isinverted"]
         # laterality = batch["laterality"]
         
-        # if label.ndim == 1 and self.num_classes == 2:
-        #     label = torch.cat([label.unsqueeze(-1), 1-label.unsqueeze(-1)], dim=1)
-
-        if stage == 'train':
-            gen_loss = self.diffusion(image, classes = label)
-            self.log(f'{stage}_gen_loss', gen_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
+        if stage == 'train' and optimizer_idx == 0:
+            loss_gen = self.diffusion(image, classes = label)
+            self.log(f'{stage}_loss_gen', loss_gen, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
         
         with torch.no_grad():
             inverted_image = self.diffusion.sample(
@@ -98,13 +95,10 @@ class DICOMLightningModule(LightningModule):
         label_cat = torch.cat([label, 1-label], dim=0)
 
         estim_cat = self.classifier(image_cat * 2.0 - 1.0)
-        cls_loss = self.loss_func(estim_cat, label_cat.unsqueeze(-1).float())
+        loss_cls = self.loss_func(estim_cat, label_cat.unsqueeze(-1).float())
 
-        self.log(f'{stage}_cls_loss', cls_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
-        loss = gen_loss + cls_loss if stage == 'train' else cls_loss
-        # print(image.shape)
-        # print(inverted_image.shape)
-        # print(inverted_label.shape)
+        self.log(f'{stage}_loss_cls', loss_cls, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
+
         if batch_idx % 10 == 0:
             grid = torchvision.utils.make_grid(
                 torch.cat([image.transpose(2, 3), 
@@ -116,11 +110,16 @@ class DICOMLightningModule(LightningModule):
             tensorboard = self.logger.experiment  # type: ignore
             tensorboard.add_image(f'{stage}_samples', grid, self.global_step // 10)
 
-        info = {f'loss': loss}
+        if optimizer_idx==0 and stage == "train": # forward picture
+            info = {f'loss': loss_gen} 
+        elif optimizer_idx==1: # forward density
+            info = {f'loss': loss_cls}
+        else:
+            info = {f'loss': loss_cls}
         return info
 
-    def training_step(self, batch, batch_idx):
-        return self._common_step(batch, batch_idx, optimizer_idx=0, stage='train')
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        return self._common_step(batch, batch_idx, optimizer_idx, stage='train')
 
     def validation_step(self, batch, batch_idx):
         return self._common_step(batch, batch_idx, optimizer_idx=0, stage='validation')
@@ -142,9 +141,11 @@ class DICOMLightningModule(LightningModule):
         return self._common_epoch_end(outputs, stage='test')
 
     def configure_optimizers(self):
-        optimizer = torch.optim.RAdam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[10, 20], gamma=0.1)
-        return [optimizer], [scheduler]
+        optimizer_g = torch.optim.RAdam(self.diffusion.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        scheduler_g = torch.optim.lr_scheduler.MultiStepLR(optimizer_g, milestones=[10, 20], gamma=0.1)
+        optimizer_d = torch.optim.RAdam(self.classifier.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        scheduler_d = torch.optim.lr_scheduler.MultiStepLR(optimizer_d, milestones=[10, 20], gamma=0.1)
+        return [optimizer_g, optimizer_d], [scheduler_g, scheduler_d]
 
 
 if __name__ == "__main__":
