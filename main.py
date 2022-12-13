@@ -111,7 +111,7 @@ class DICOMLightningModule(LightningModule):
                            label.view(image.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape),
                            inverted_image.transpose(2, 3), 
                            inverted_label.transpose(2, 3)], dim=-2), 
-                normalize=False, scale_each=False, nrow=8, padding=0
+                normalize=False, scale_each=False, nrow=image.shape[0], padding=0
             )
             tensorboard = self.logger.experiment  # type: ignore
             tensorboard.add_image(f'{stage}_samples', grid, self.global_step // 10)
@@ -218,8 +218,8 @@ if __name__ == "__main__":
         train_csvfile=train_csvfile,
         val_datadir=train_datadir,
         val_csvfile=train_csvfile,
-        test_datadir=train_datadir,
-        test_csvfile=train_csvfile,
+        test_datadir=test_datadir,
+        test_csvfile=None,
         batch_size=hparams.batch_size,
         shape=hparams.shape,
     )

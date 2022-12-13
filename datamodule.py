@@ -182,7 +182,7 @@ class DICOMDataModule(LightningDataModule):
         set_determinism(seed=seed)
 
     def train_dataloader(self):
-        has_png = False
+        has_png = self.train_csvfile is not None # 
         self.train_transforms = Compose([
             LoadImaged(
                 keys=["image"], 
@@ -229,7 +229,7 @@ class DICOMDataModule(LightningDataModule):
         return self.train_loader
 
     def val_dataloader(self):
-        has_png = False
+        has_png = self.val_csvfile is not None # 
         self.val_transforms = Compose([
             LoadImaged(
                 keys=["image"], 
