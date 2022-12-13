@@ -16,6 +16,7 @@ from monai.transforms import (
     EnsureChannelFirstd,
     Compose,
     OneOf,
+    Identityd,
     LoadImaged,
     Spacingd,
     Orientationd,
@@ -44,6 +45,7 @@ class DICOMDataset(Dataset, Randomizable):
         length: Optional[Callable] = None,
         batch_size: int = 32, 
         upsample: bool = True,
+        has_png: bool = False,
     ) -> None: 
         self.keys = keys,
         self.datadir = datadir
@@ -52,6 +54,8 @@ class DICOMDataset(Dataset, Randomizable):
         self.batch_size = batch_size
         self.transform = transform
         self.upsample = upsample
+        self.has_png = has_png
+
         def glob_files(folders: str = None, extension: str = '*.nii.gz'):  # type: ignore
             assert folders is not None
             # paths = [glob.glob(os.path.join(folder, extension), recursive=True) for folder in folders]
@@ -102,33 +106,37 @@ class DICOMDataset(Dataset, Randomizable):
         
         if self.df is not None:
             label = self.df.loc[(self.df['patient_id'] == int(patient_id)) & (self.df['image_id'] == int(image_id)), 'cancer'].values[0]
-        data["image"] = filepath
+        data["image"] = filepath.replace("dcm", "png") if self.has_png else filepath # Adjust fast reading here
         data["label"] = 1 if label==1 else 0
         # data["label"] = 1. if label==1 else 0.
         data["patient_id"] = patient_id if patient_id is not None else None
         data["image_id"] = image_id if image_id is not None else None
         
-        # Attach other attributes
-        # Extracting data from the mri file
-        _dcm = pydicom.read_file(filepath)
+        if self.has_png:
+            pass
+        else:
+            # Attach other attributes
+            # Extracting data from the mri file
+            _dcm = pydicom.read_file(filepath)
 
-        # depending on this value, X-ray may look inverted - fix that:
-        # data["isinverted"] = 1.0 if _dcm.PhotometricInterpretation == "MONOCHROME1" else 0.0
-        if _dcm.PhotometricInterpretation is not None and _dcm.PhotometricInterpretation == "MONOCHROME1":
-            data["isinverted"] = 1
-        else: 
-            data["isinverted"] = 0
-        # Extract the laterality
-        # L left
-        # R right
-        # B both (e.g., cleavage)
-        if _dcm.ImageLaterality == "L":
-            data["laterality"] = 0
-        elif _dcm.ImageLaterality == "R":
-            data["laterality"] = 1
-        # elif _dcm.ImageLaterality == "B":
-        #     data["laterality"] = 2
-        # print(data)
+            # depending on this value, X-ray may look inverted - fix that:
+            # data["isinverted"] = 1.0 if _dcm.PhotometricInterpretation == "MONOCHROME1" else 0.0
+            if _dcm.PhotometricInterpretation is not None and _dcm.PhotometricInterpretation == "MONOCHROME1":
+                data["isinverted"] = 1
+            else: 
+                data["isinverted"] = 0
+            # Extract the laterality
+            # L left
+            # R right
+            # B both (e.g., cleavage)
+            if _dcm.ImageLaterality == "L":
+                data["laterality"] = 0
+            elif _dcm.ImageLaterality == "R":
+                data["laterality"] = 1
+            # elif _dcm.ImageLaterality == "B":
+            #     data["laterality"] = 2
+            # print(data)
+
         # Apply other transforms for image augmentations
         if self.transform is not None:
             data = apply_transform(self.transform, data)
@@ -151,7 +159,7 @@ class DICOMDataModule(LightningDataModule):
         test_csvfile: str = "path/to/csvfile",
         test_datadir: str = "path/to/datadir",
         shape: int = 256,
-        batch_size: int = 32
+        batch_size: int = 32, 
     ) -> None:
         super().__init__()
 
@@ -174,10 +182,11 @@ class DICOMDataModule(LightningDataModule):
         set_determinism(seed=seed)
 
     def train_dataloader(self):
+        has_png = False
         self.train_transforms = Compose([
             LoadImaged(
                 keys=["image"], 
-                reader="pydicomreader",
+                reader="pilreader" if has_png else "pydicomreader",
                 ensure_channel_first=True, 
                 # image_only=True, 
                 # overwriting=True, 
@@ -189,7 +198,7 @@ class DICOMDataModule(LightningDataModule):
             # Spacingd(keys=["image"], pixdim=(1.0, 1.0), mode=["bilinear"], align_corners=True),
             # SqueezeDimd(keys=["image"], dim=3),
             ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0,),
-            PhotometricInterpretationMONOCHROME1(), 
+            Identityd(keys=["image"]) if has_png else PhotometricInterpretationMONOCHROME1(), 
             CropForegroundd(keys=["image"], source_key="image", select_fn=(lambda x: x < 1), margin=0),
             # HistogramNormalized(keys=["image"], min=0.0, max=1.0,),  # type: ignore
             # RandRotated(keys=["image"], prob=1.0, range_x=0.3),
@@ -197,7 +206,7 @@ class DICOMDataModule(LightningDataModule):
             Resized(keys=["image"], spatial_size=self.shape, size_mode="longest", mode=["bilinear"], align_corners=True),
             RandFlipd(keys=["image"], prob=0.5, spatial_axis=0),
             DivisiblePadd(keys=["image"], k=self.shape, mode="constant", constant_values=1),
-            ToTensord(keys=["image", "label", "isinverted", "laterality"],),
+            ToTensord(keys=["image", "label"]) if has_png else ToTensord(keys=["image", "label", "isinverted", "laterality"],),
         ])
 
         self.train_datasets = DICOMDataset(
@@ -206,7 +215,8 @@ class DICOMDataModule(LightningDataModule):
             csvfile=self.train_csvfile,
             transform=self.train_transforms,  
             batch_size=self.batch_size,  
-            length=100000,
+            length=100000, 
+            has_png=has_png
         )
 
         self.train_loader = DataLoader(
@@ -219,10 +229,11 @@ class DICOMDataModule(LightningDataModule):
         return self.train_loader
 
     def val_dataloader(self):
+        has_png = False
         self.val_transforms = Compose([
             LoadImaged(
                 keys=["image"], 
-                reader="pydicomreader",
+                reader="pilreader" if has_png else "pydicomreader",
                 ensure_channel_first=True, 
                 # image_only=True, 
                 # overwriting=True, 
@@ -234,13 +245,13 @@ class DICOMDataModule(LightningDataModule):
             # Spacingd(keys=["image"], pixdim=(1.0, 1.0), mode=["bilinear"], align_corners=True),
             # SqueezeDimd(keys=["image"], dim=3),
             ScaleIntensityd(keys=["image"], minv=0.0, maxv=1.0,),
-            PhotometricInterpretationMONOCHROME1(), 
+            Identityd(keys=["image"]) if has_png else PhotometricInterpretationMONOCHROME1(), 
             CropForegroundd(keys=["image"], source_key="image", select_fn=(lambda x: x < 1), margin=0),
             # HistogramNormalized(keys=["image"], min=0.0, max=1.0,),  # type: ignore
             # RandZoomd(keys=["image"], prob=1.0, min_zoom=0.8, max_zoom=1.1, padding_mode='edge', mode=["bilinear"], align_corners=True),
             Resized(keys=["image"], spatial_size=self.shape, size_mode="longest", mode=["bilinear"], align_corners=True),
             DivisiblePadd(keys=["image"], k=self.shape, mode="constant", constant_values=1),
-            ToTensord(keys=["image", "label", "isinverted", "laterality"],),
+            ToTensord(keys=["image", "label"]) if has_png else ToTensord(keys=["image", "label", "isinverted", "laterality"],),
         ])
 
         self.val_datasets = DICOMDataset(
@@ -249,7 +260,8 @@ class DICOMDataModule(LightningDataModule):
             csvfile=self.val_csvfile,
             transform=self.val_transforms,
             batch_size=self.batch_size,
-            length=100000,
+            length=100000, 
+            has_png=has_png
         )
 
         self.val_loader = DataLoader(

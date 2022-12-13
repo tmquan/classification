@@ -66,7 +66,7 @@ class DICOMLightningModule(LightningModule):
             nn.Sigmoid(),
         )
         # self.loss_func = nn.BCELoss()
-        self.loss_func = DiceFocalLoss()
+        self.loss_func = DiceLoss()
         self.save_hyperparameters()
 
     def forward(self, image):
@@ -76,8 +76,9 @@ class DICOMLightningModule(LightningModule):
         image = batch["image"]
         label = batch["label"]
         _device = image.device
-        isinverted = batch["isinverted"]
-        laterality = batch["laterality"]
+
+        # isinverted = batch["isinverted"]
+        # laterality = batch["laterality"]
         
         # if label.ndim == 1 and self.num_classes == 2:
         #     label = torch.cat([label.unsqueeze(-1), 1-label.unsqueeze(-1)], dim=1)
@@ -87,28 +88,29 @@ class DICOMLightningModule(LightningModule):
             self.log(f'{stage}_gen_loss', gen_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
         
         with torch.no_grad():
-            sampled_image = self.diffusion.sample(
-                classes = label,
+            inverted_image = self.diffusion.sample(
+                classes = 1-label,
                 cond_scale = 3.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
             )
-            sampled_label = label.view(image.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape)
+            inverted_label = (1-label).view(image.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape)
         
-        image_cat = torch.cat([image, sampled_image], dim=0)
-        label_cat = torch.cat([label, label], dim=0)
-        # label_cat = torch.where(label_cat < 0.5, label_cat + 0.0001, label_cat - 0.0001)
+        image_cat = torch.cat([image, inverted_image], dim=0)
+        label_cat = torch.cat([label, 1-label], dim=0)
+
         estim_cat = self.classifier(image_cat * 2.0 - 1.0)
         cls_loss = self.loss_func(estim_cat, label_cat.unsqueeze(-1).float())
 
         self.log(f'{stage}_cls_loss', cls_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
         loss = gen_loss + cls_loss if stage == 'train' else cls_loss
         # print(image.shape)
-        # print(sampled_image.shape)
-        # print(sampled_label.shape)
+        # print(inverted_image.shape)
+        # print(inverted_label.shape)
         if batch_idx % 10 == 0:
             grid = torchvision.utils.make_grid(
                 torch.cat([image.transpose(2, 3), 
-                           sampled_image.transpose(2, 3), 
-                           sampled_label.transpose(2, 3)], dim=-2), 
+                           label.view(image.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape),
+                           inverted_image.transpose(2, 3), 
+                           inverted_label.transpose(2, 3)], dim=-2), 
                 normalize=False, scale_each=False, nrow=8, padding=0
             )
             tensorboard = self.logger.experiment  # type: ignore
