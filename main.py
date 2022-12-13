@@ -70,58 +70,57 @@ class DICOMLightningModule(LightningModule):
         self.save_hyperparameters()
 
     def forward(self, image):
-        pass
+        return self.classifier.forward(image * 2.0 - 1.0)
 
     def _common_step(self, batch, batch_idx, optimizer_idx, stage: Optional[str] = 'evaluation'):
-        image = batch["image"]
-        label = batch["label"]
-        _device = image.device
+        img = batch["image"]
+        lbl = batch["label"]
+        _device = img.device
 
         # isinverted = batch["isinverted"]
         # laterality = batch["laterality"]
         
         if stage == 'train' and optimizer_idx == 0:
-            loss_gen = self.diffusion(image, classes = label)
-            self.log(f'{stage}_loss_gen', loss_gen, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
+            gen_loss = self.diffusion(img, classes = lbl)
+            self.log(f'{stage}_gen_loss', gen_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
         
         elif stage == 'train' and optimizer_idx == 1:
             with torch.no_grad():
-                inverted_image = self.diffusion.sample(
-                    classes = 1-label,
-                    cond_scale = 3.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
+                inv_img = self.diffusion.sample(
+                    classes = 1-lbl,
+                    cond_scale = 3. # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
                 )
-                inverted_label = (1-label).view(image.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape)
+                inv_lbl = (1-lbl).view(img.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape)
             
-            image_cat = torch.cat([image, inverted_image], dim=0)
-            label_cat = torch.cat([label, 1-label], dim=0)
+            img_ccat = torch.cat([img, inv_img], dim=0)
+            lbl_ccat = torch.cat([lbl, 1-lbl], dim=0)
 
-            estim_cat = self.classifier(image_cat * 2.0 - 1.0)
-            loss_cls = self.loss_func(estim_cat, label_cat.unsqueeze(-1).float())
-
-            self.log(f'{stage}_loss_cls', loss_cls, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
+            est_ccat = self.forward(img_ccat)
+            cls_loss = self.loss_func(est_ccat, lbl_ccat.unsqueeze(-1).float())
+            self.log(f'{stage}_cls_loss', cls_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
 
             if batch_idx % 10 < 2:
                 grid = torchvision.utils.make_grid(
-                    torch.cat([image.transpose(2, 3), 
-                            label.view(image.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape),
-                            inverted_image.transpose(2, 3), 
-                            inverted_label.transpose(2, 3)], dim=-2), 
-                    normalize=False, scale_each=False, nrow=image.shape[0], padding=0
+                    torch.cat([img.transpose(2, 3), 
+                               lbl.view(img.shape[0], 1, 1, 1).repeat(1, 1, self.shape, self.shape),
+                               inv_img.transpose(2, 3), 
+                               inv_lbl.transpose(2, 3)], dim=-2), 
+                    normalize=False, scale_each=False, nrow=img.shape[0], padding=0
                 )
                 tensorboard = self.logger.experiment  # type: ignore
                 tensorboard.add_image(f'{stage}_samples', grid, self.global_step // 10)
 
         else:
-            estim = self.classifier(image * 2.0 - 1.0)
-            loss_cls = self.loss_func(estim, label.unsqueeze(-1).float())
-            self.log(f'{stage}_loss_cls', loss_cls, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
+            est = self.forward(img)
+            cls_loss = self.loss_func(est, lbl.unsqueeze(-1).float())
+            self.log(f'{stage}_cls_loss', cls_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
 
         if optimizer_idx==0 and stage == "train": # gen
-            info = {f'loss': loss_gen} 
+            info = {f'loss': gen_loss} 
         elif optimizer_idx==1 and stage == "train": # cls
-            info = {f'loss': loss_cls}
+            info = {f'loss': cls_loss}
         else:
-            info = {f'loss': loss_cls}
+            info = {f'loss': cls_loss}
         return info
 
     def training_step(self, batch, batch_idx, optimizer_idx):
