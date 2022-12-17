@@ -26,57 +26,7 @@ from pytorch_lightning.utilities.seed import seed_everything
 from monai.losses.dice import DiceLoss, DiceFocalLoss
 from monai.networks.nets import EfficientNetBN, DenseNet121, DenseNet201
 
-from diffusers import UNet2DModel, DDPMScheduler
-
 from datamodule import DICOMDataModule
-
-class ClassConditionedUNet(nn.Module):
-    def __init__(self, shape= 256, num_classes=2, class_emb_size=2):
-        super().__init__()
-        
-        # The embedding layer will map the class label to a vector of size class_emb_size
-        self.class_emb = nn.Embedding(num_classes, class_emb_size)
-
-        # Self.model is an unconditional UNet with extra input channels to accept the conditioning information (the class embedding)
-        self.model = UNet2DModel(
-            sample_size=shape,  # the target image resolution
-            in_channels=1 + class_emb_size,  # the number of input channels, 3 for RGB images
-            out_channels=1,  # the number of output channels
-            layers_per_block=2,  # how many ResNet layers to use per UNet block
-            block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channes for each UNet block
-            down_block_types=( 
-                "DownBlock2D",  # a regular ResNet downsampling block
-                "DownBlock2D", 
-                "DownBlock2D", 
-                "DownBlock2D", 
-                "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-                "DownBlock2D",
-            ), 
-            up_block_types=(
-                "UpBlock2D",  # a regular ResNet upsampling block
-                "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-                "UpBlock2D", 
-                "UpBlock2D", 
-                "UpBlock2D", 
-                "UpBlock2D"  
-            ),
-        )
-
-  # Our forward method now takes the class labels as an additional argument
-    def forward(self, x, t, class_labels):
-        # Shape of x:
-        bs, ch, w, h = x.shape
-        
-        # class conditioning in right shape to add as additional input channels
-        class_cond = self.class_emb(class_labels) # Map to embedding dinemsion
-        class_cond = class_cond.view(bs, class_cond.shape[1], 1, 1).expand(bs, class_cond.shape[1], w, h)
-        # x is shape (bs, 1, 28, 28) and class_cond is now (bs, 4, 28, 28)
-
-        # Net input is now x and class cond concatenated together along dimension 1
-        net_input = torch.cat((x, class_cond), 1) # (bs, 5, 28, 28)
-
-        # Feed this to the unet alongside the timestep and return the prediction
-        return self.model(net_input, t).sample # (bs, 1, 28, 28)
 
 class DICOMLightningModule(LightningModule):
     def __init__(self, hparams, **kwargs):
@@ -115,7 +65,6 @@ class DICOMLightningModule(LightningModule):
         cls_loss = self.loss_func(est, lbl.unsqueeze(-1).float())
         self.log(f'{stage}_cls_loss', cls_loss, on_step=(stage == 'train'), prog_bar=True, logger=True, sync_dist=True, batch_size=self.batch_size)
 
-
         info = {f'loss': cls_loss}
         return info
 
@@ -142,9 +91,9 @@ class DICOMLightningModule(LightningModule):
         return self._common_epoch_end(outputs, stage='test')
 
     def configure_optimizers(self):
-        optimizer_d = torch.optim.RAdam(self.classifier.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        optimizer_d = torch.optim.RAdam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         scheduler_d = torch.optim.lr_scheduler.MultiStepLR(optimizer_d, milestones=[10, 20], gamma=0.1)
-        return optimizer_d, scheduler_d
+        return [optimizer_d], [scheduler_d]
 
 
 if __name__ == "__main__":
